@@ -1,48 +1,60 @@
-<html>
+<!DOCTYPE html>
+<html lang="mi">
 <head>
-    <title>Emoji Game</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Raupatu Card Game</title>
     <style>
-        body { font-family: Arial, sans-serif; }
-        .emoji-avatars { display: flex; justify-content: space-around; }
-        .hud { background: #f0f0f0; padding: 10px; }
+        body { font-family: Arial, sans-serif; background-color: #f0f0f0; }
+        .table { background: url('maori_table.jpg'); height: 600px; position: relative; }
+        .player-pile { position: absolute; } /* Add specific positioning */
+        .card { width: 100px; height: 140px; margin: 5px; }
     </style>
 </head>
 <body>
-    <div class="setup">
-        <h1>Welcome to the Emoji Game!</h1>
-        <div class="emoji-avatars">
-            <span>😀</span>
-            <span>😃</span>
-            <span>😄</span>
-            <span>😅</span>
-        </div>
-        <label>
-            <input type="checkbox" id="bot-option"> Play with Bot
-        </label>
-        <button id="start-game">Start Game</button>
-    </div>
-    <div class="hud">
-        <h2>Players</h2>
-        <div id="players-info"></div>
-        <h3>Card Hands</h3>
-        <div id="card-info"></div>
+    <div class="table">
+        <div class="player-pile" id="player-pile-1"></div>
+        <div class="player-pile" id="player-pile-2"></div>
+        <div class="deck" id="deck"></div>
+        <div class="hands" id="hands"></div>
+        <div class="status-messages" id="status-messages"></div>
     </div>
     <script>
-        // Game logic will handle card drawing and emoji display
-        let players = ['😀', '😃', '😄', '😅'];
-        let cards = drawnCards();
-        displayPlayers();
+        let deck = []; // Initialize deck
+        let playerHand = []; // Player's hand
+        let opponentsHand = []; // AI opponent's hand
+        let maxSteals = 3;
+        let currentPlayer = 'player';
 
-        function drawnCards() {
-            return ['🔴', '🔵', '🟢']; // Simulating drawn cards
+        function initializeGame() {
+            // Initialize deck and game state
+            drawCards();
+            updateStatus("Tēnā, me tākaro! Ready to play!");
         }
 
-        function displayPlayers() {
-            let infoDiv = document.getElementById('players-info');
-            players.forEach(player => {
-                infoDiv.innerHTML += `${player}: ${cards.length} cards<br>`;
-            });
+        function drawCards() {
+            while (playerHand.length < 3 && deck.length > 0) {
+                playerHand.push(deck.pop());
+            }
+            // Similarly for opponent's hand
         }
+
+        function stealCards() {
+            // Logic for stealing cards
+            // Ensure maximum 3 cards per turn
+        }
+
+        function checkEndGame() {
+            if (deck.length === 0 && (playerHand.length === 0 || opponentsHand.length === 0)) {
+                updateStatus("Kua mutu te kēmu! The game has ended!");
+            }
+        }
+
+        function updateStatus(message) {
+            document.getElementById('status-messages').innerText = message;
+        }
+
+        initializeGame();
     </script>
 </body>
 </html>
