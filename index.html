@@ -1,455 +1,48 @@
-<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Raupatu - 3D Card Game</title>
+    <title>Emoji Game</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: Arial, sans-serif;
-            background: #1a1a1a;
-            color: white;
-            overflow: hidden;
-        }
-        canvas {
-            display: block;
-            width: 100%;
-            height: 100vh;
-        }
-        #hud {
-            position: absolute;
-            top: 20px;
-            left: 20px;
-            background: rgba(0, 0, 0, 0.7);
-            padding: 20px;
-            border-radius: 10px;
-            font-size: 14px;
-            z-index: 10;
-            max-width: 300px;
-        }
-        #scores {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            background: rgba(0, 0, 0, 0.7);
-            padding: 20px;
-            border-radius: 10px;
-            font-size: 16px;
-            z-index: 10;
-        }
-        #hand {
-            position: absolute;
-            bottom: 30px;
-            left: 50%;
-            transform: translateX(-50%);
-            background: rgba(0, 0, 0, 0.8);
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            z-index: 10;
-        }
-        .card-slot {
-            display: inline-block;
-            width: 80px;
-            height: 120px;
-            margin: 0 10px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 2px solid white;
-            border-radius: 5px;
-            cursor: grab;
-            font-size: 24px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: bold;
-        }
-        .card-slot:hover {
-            background: rgba(255, 255, 255, 0.2);
-        }
-        #gameStatus {
-            position: absolute;
-            bottom: 20px;
-            right: 20px;
-            background: rgba(0, 0, 0, 0.7);
-            padding: 15px;
-            border-radius: 10px;
-            font-size: 14px;
-            max-width: 250px;
-        }
-        #setupScreen {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.95);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-        .setup-container {
-            background: #333;
-            padding: 40px;
-            border-radius: 15px;
-            text-align: center;
-            max-width: 500px;
-        }
-        .setup-container h1 {
-            font-size: 32px;
-            margin-bottom: 30px;
-            color: #4CAF50;
-        }
-        .setup-container input {
-            width: 100%;
-            padding: 10px;
-            margin: 10px 0;
-            border: none;
-            border-radius: 5px;
-            font-size: 14px;
-        }
-        .setup-container button {
-            width: 100%;
-            padding: 12px;
-            margin-top: 20px;
-            background: #4CAF50;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            font-size: 16px;
-            cursor: pointer;
-            font-weight: bold;
-        }
-        .setup-container button:hover {
-            background: #45a049;
-        }
-        .player-input {
-            margin: 15px 0;
-            text-align: left;
-        }
-        .player-input label {
-            display: block;
-            margin-bottom: 5px;
-            color: #aaa;
-        }
+        body { font-family: Arial, sans-serif; }
+        .emoji-avatars { display: flex; justify-content: space-around; }
+        .hud { background: #f0f0f0; padding: 10px; }
     </style>
 </head>
 <body>
-    <div id="setupScreen">
-        <div class="setup-container">
-            <h1>🃏 RAUPATU</h1>
-            <p style="margin-bottom: 20px; color: #aaa;">Enter player names (2-4 players)</p>
-            <div id="playerInputs"></div>
-            <button onclick="startGame()">Start Game</button>
+    <div class="setup">
+        <h1>Welcome to the Emoji Game!</h1>
+        <div class="emoji-avatars">
+            <span>😀</span>
+            <span>😃</span>
+            <span>😄</span>
+            <span>😅</span>
         </div>
+        <label>
+            <input type="checkbox" id="bot-option"> Play with Bot
+        </label>
+        <button id="start-game">Start Game</button>
     </div>
-
-    <div id="hud">
-        <div><strong>Current Player:</strong> <span id="currentPlayer">-</span></div>
-        <div><strong>Action:</strong> <span id="action">Waiting...</span></div>
-        <div><strong>Piles Stolen:</strong> <span id="pilesSteals">0/3</span></div>
-        <div><strong>Cards Drawn:</strong> <span id="cardsDrawn">0/3</span></div>
+    <div class="hud">
+        <h2>Players</h2>
+        <div id="players-info"></div>
+        <h3>Card Hands</h3>
+        <div id="card-info"></div>
     </div>
-
-    <div id="scores">
-        <strong>Scores:</strong>
-        <div id="scoreList"></div>
-    </div>
-
-    <div id="hand">
-        <div style="margin-bottom: 10px;"><strong>Your Hand</strong></div>
-        <div id="handCards"></div>
-    </div>
-
-    <div id="gameStatus">
-        <div id="statusText">Loading...</div>
-    </div>
-
-    <script src="https://threejs.org/build/three.min.js"></script>
     <script>
-        // Game State
-        let gameState = {
-            players: [],
-            currentPlayerIndex: 0,
-            deck: [],
-            table: [],
-            pilesStolenThisTurn: 0,
-            cardsDrawnThisTurn: 0,
-            selectedCard: null,
-            gameOver: false
-        };
+        // Game logic will handle card drawing and emoji display
+        let players = ['😀', '😃', '😄', '😅'];
+        let cards = drawnCards();
+        displayPlayers();
 
-        let scene, camera, renderer;
-        let cardMeshes = [];
-        let raycaster = new THREE.Raycaster();
-        let mouse = new THREE.Vector2();
-
-        // Card Deck Generation
-        function generateDeck() {
-            const suits = ['♠', '♥', '♦', '♣'];
-            const values = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
-            const deck = [];
-
-            for (let suit of suits) {
-                for (let value of values) {
-                    deck.push({ value, suit, id: Math.random() });
-                }
-            }
-
-            return deck.sort(() => Math.random() - 0.5);
+        function drawnCards() {
+            return ['🔴', '🔵', '🟢']; // Simulating drawn cards
         }
 
-        function initGame() {
-            gameState.deck = generateDeck();
-            gameState.players.forEach(player => {
-                player.hand = [];
-                player.pile = [];
-                player.score = 0;
-
-                for (let i = 0; i < 3; i++) {
-                    if (gameState.deck.length > 0) {
-                        player.hand.push(gameState.deck.pop());
-                    }
-                }
-            });
-
-            initThreeJS();
-            updateUI();
-            gameLoop();
-        }
-
-        function initThreeJS() {
-            scene = new THREE.Scene();
-            scene.background = new THREE.Color(0x1a1a1a);
-
-            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-            camera.position.set(0, 1.6, 3);
-
-            renderer = new THREE.WebGLRenderer({ antialias: true });
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            renderer.shadowMap.enabled = true;
-            renderer.shadowMap.type = THREE.PCFShadowShadowMap;
-            document.body.appendChild(renderer.domElement);
-
-            // Lighting
-            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-            scene.add(ambientLight);
-
-            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-            directionalLight.position.set(5, 10, 7);
-            directionalLight.castShadow = true;
-            directionalLight.shadow.mapSize.width = 2048;
-            directionalLight.shadow.mapSize.height = 2048;
-            scene.add(directionalLight);
-
-            // Table
-            const tableGeometry = new THREE.PlaneGeometry(20, 20);
-            const tableMaterial = new THREE.MeshLambertMaterial({ color: 0x1a5a1a });
-            const table = new THREE.Mesh(tableGeometry, tableMaterial);
-            table.receiveShadow = true;
-            scene.add(table);
-
-            // Mouse Events
-            window.addEventListener('click', onMouseClick);
-            window.addEventListener('mousemove', onMouseMove);
-            window.addEventListener('resize', onWindowResize);
-        }
-
-        function createCardMesh(card, position) {
-            const geometry = new THREE.BoxGeometry(0.6, 1, 0.05);
-            const material = new THREE.MeshStandardMaterial({ color: 0xffffff });
-            const mesh = new THREE.Mesh(geometry, material);
-            mesh.castShadow = true;
-            mesh.receiveShadow = true;
-            mesh.position.copy(position);
-            mesh.userData = card;
-
-            scene.add(mesh);
-            return mesh;
-        }
-
-        function updateUI() {
-            const currentPlayer = gameState.players[gameState.currentPlayerIndex];
-            document.getElementById('currentPlayer').textContent = currentPlayer.name;
-            document.getElementById('pilesSteals').textContent = `${gameState.pilesStolenThisTurn}/3`;
-            document.getElementById('cardsDrawn').textContent = `${gameState.cardsDrawnThisTurn}/3`;
-
-            // Hand Display
-            let handHTML = '';
-            currentPlayer.hand.forEach((card, index) => {
-                handHTML += `<div class="card-slot" onclick="selectCard(${index})">${card.value}${card.suit}</div>`;
-            });
-            document.getElementById('handCards').textContent = handHTML || 'No cards';
-            document.getElementById('handCards').innerHTML = handHTML || 'No cards';
-
-            // Scores Display
-            let scoreHTML = '';
-            gameState.players.forEach(player => {
-                scoreHTML += `<div>${player.name}: ${player.score} cards</div>`;
-            });
-            document.getElementById('scoreList').innerHTML = scoreHTML;
-
-            // Status
-            let status = `Current Turn: ${currentPlayer.name}<br>`;
-            if (gameState.pilesStolenThisTurn < 3 && gameState.cardsDrawnThisTurn < 3) {
-                status += 'Select a card from your hand and match it to steal piles!';
-            } else if (gameState.cardsDrawnThisTurn < 3) {
-                status += `Draw ${3 - gameState.cardsDrawnThisTurn} more card(s) to continue.`;
-            } else {
-                status += 'Your turn is complete. Click next to end turn.';
-            }
-            document.getElementById('statusText').innerHTML = status;
-        }
-
-        function selectCard(index) {
-            const currentPlayer = gameState.players[gameState.currentPlayerIndex];
-            gameState.selectedCard = currentPlayer.hand[index];
-            document.getElementById('action').textContent = `Card Selected: ${gameState.selectedCard.value}${gameState.selectedCard.suit}`;
-        }
-
-        function stealPile(playerIndex) {
-            if (gameState.pilesStolenThisTurn >= 3) {
-                alert('You can only steal 3 piles per turn!');
-                return;
-            }
-
-            const currentPlayer = gameState.players[gameState.currentPlayerIndex];
-            const targetPlayer = gameState.players[playerIndex];
-
-            if (!gameState.selectedCard) {
-                alert('Select a card first!');
-                return;
-            }
-
-            const topCard = targetPlayer.pile[targetPlayer.pile.length - 1];
-            if (topCard && (topCard.value === gameState.selectedCard.value || topCard.suit === gameState.selectedCard.suit)) {
-                // Steal the pile
-                currentPlayer.pile.push(...targetPlayer.pile);
-                currentPlayer.score += targetPlayer.pile.length;
-                targetPlayer.pile = [];
-
-                gameState.pilesStolenThisTurn++;
-                document.getElementById('action').textContent = `Stole pile from ${targetPlayer.name}!`;
-
-                if (gameState.pilesStolenThisTurn >= 3) {
-                    drawCards();
-                }
-            } else {
-                alert('Card does not match!');
-            }
-
-            updateUI();
-        }
-
-        function drawCards() {
-            const currentPlayer = gameState.players[gameState.currentPlayerIndex];
-            const needCards = 3 - currentPlayer.hand.length;
-
-            for (let i = 0; i < needCards && gameState.cardsDrawnThisTurn < 3 && gameState.deck.length > 0; i++) {
-                currentPlayer.hand.push(gameState.deck.pop());
-                gameState.cardsDrawnThisTurn++;
-            }
-
-            updateUI();
-        }
-
-        function nextTurn() {
-            gameState.currentPlayerIndex = (gameState.currentPlayerIndex + 1) % gameState.players.length;
-            gameState.pilesStolenThisTurn = 0;
-            gameState.cardsDrawnThisTurn = 0;
-            gameState.selectedCard = null;
-
-            // Check win condition
-            if (gameState.deck.length === 0) {
-                let winner = gameState.players.reduce((prev, current) => 
-                    (prev.score > current.score) ? prev : current
-                );
-                document.getElementById('statusText').innerHTML = `Game Over! ${winner.name} wins with ${winner.score} cards!`;
-                gameState.gameOver = true;
-            }
-
-            updateUI();
-        }
-
-        function onMouseClick(event) {
-            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
-            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
-
-            raycaster.setFromCamera(mouse, camera);
-            const intersects = raycaster.intersectObjects(scene.children);
-
-            if (intersects.length > 0) {
-                const object = intersects[0].object;
-                if (object.userData.value) {
-                    selectCard(gameState.players[gameState.currentPlayerIndex].hand.indexOf(object.userData));
-                }
-            }
-        }
-
-        function onMouseMove(event) {
-            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
-            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
-        }
-
-        function onWindowResize() {
-            camera.aspect = window.innerWidth / window.innerHeight;
-            camera.updateProjectionMatrix();
-            renderer.setSize(window.innerWidth, window.innerHeight);
-        }
-
-        function gameLoop() {
-            requestAnimationFrame(gameLoop);
-            renderer.render(scene, camera);
-        }
-
-        function startGame() {
-            const playerInputs = document.querySelectorAll('#playerInputs input');
-            let players = [];
-
-            playerInputs.forEach((input, index) => {
-                if (input.value.trim()) {
-                    players.push({
-                        name: input.value.trim(),
-                        hand: [],
-                        pile: [],
-                        score: 0
-                    });
-                }
-            });
-
-            if (players.length < 2 || players.length > 4) {
-                alert('Please enter 2-4 player names!');
-                return;
-            }
-
-            gameState.players = players;
-            document.getElementById('setupScreen').style.display = 'none';
-            initGame();
-
-            // Add keyboard shortcuts
-            window.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter' && !gameState.gameOver) nextTurn();
-                if (e.key === ' ') drawCards();
+        function displayPlayers() {
+            let infoDiv = document.getElementById('players-info');
+            players.forEach(player => {
+                infoDiv.innerHTML += `${player}: ${cards.length} cards<br>`;
             });
         }
-
-        // Setup UI
-        window.addEventListener('load', () => {
-            const playerInputsDiv = document.getElementById('playerInputs');
-            for (let i = 0; i < 4; i++) {
-                playerInputsDiv.innerHTML += `
-                    <div class="player-input">
-                        <label>Player ${i + 1}:</label>
-                        <input type="text" placeholder="Enter name" ${i < 2 ? 'required' : ''}>
-                    </div>
-                `;
-            }
-        });
     </script>
 </body>
 </html>
