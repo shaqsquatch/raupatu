@@ -1,0 +1,1155 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAME CONSTANTS & HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+const RANKS = ["A","K","Q","J","10","9","8","7","6","5","4","3","2"];
+const SUITS = ["♠","♥","♦","♣"];
+const RED   = new Set(["♥","♦"]);
+const RV    = r => ({A:14,K:13,Q:12,J:11}[r] ?? +r);
+const SEAT  = [
+  { ring:"#059669", bg:"#012818", label:"#6ee7b7" },
+  { ring:"#be123c", bg:"#3b0010", label:"#fda4af" },
+  { ring:"#7c3aed", bg:"#200050", label:"#c4b5fd" },
+  { ring:"#0891b2", bg:"#012030", label:"#67e8f9" },
+];
+
+const topOf   = p => p.length ? p[p.length-1] : null;
+const cloneP  = ps => ps.map(p=>({...p,hand:[...p.hand],pile:[...p.pile]}));
+const randCode= ()=>Math.random().toString(36).slice(2,6).toUpperCase();
+
+function makeDeck(){ return RANKS.flatMap(r=>SUITS.map(s=>({r,s,id:r+s}))); }
+function shuffle(a){ const b=[...a]; for(let i=b.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[b[i],b[j]]=[b[j],b[i]];} return b; }
+
+// Fill player pid's hand up to 3 cards (or until deck runs out).
+// When deck is empty, hand stays as-is (plays out remaining cards).
+function fillHand(players, deck, pid) {
+  const d = [...deck], ps = cloneP(players);
+  while (ps[pid].hand.length < 3 && d.length) { ps[pid].hand.push(d.shift()); }
+  return { players: ps, deck: d };
+}
+// Keep drawBack as alias used in GameTable multiplayer push paths
+const drawBack = fillHand;
+
+function nextTurn(G,pid){
+  return{...G,turn:(pid+1)%G.players.length,sel:null,mode:null,stealsCount:0,cardsUsed:0,frozenPiles:[]};
+}
+function maybeOver(G){
+  if(G.deck.length>0)return G;
+  if(G.players.some(p=>p.hand.length>0))return G;
+  const ps=G.players.map(p=>({...p,pile:[]}));
+  const best=Math.max(...G.players.map(p=>p.pile.length));
+  const tops=G.players.filter(p=>p.pile.length===best);
+  const winner=tops.length>1?"Tie":tops[0].name;
+  const msg=tops.length>1?`🤝 He ōrite! Tie – ${tops.map(t=>t.name).join(" & ")} (${best} cards)`
+    :`🏆 ${winner} wins with ${best} cards!`;
+  return{...G,players:ps,phase:"over",winner,log:[...G.log,msg]};
+}
+function freshGame(names){
+  const deck=shuffle(makeDeck());
+  return{
+    deck,players:names.map((name,id)=>({id,name,hand:deck.splice(0,3),pile:[]})),
+    turn:0,sel:null,mode:null,stealsCount:0,cardsUsed:0,frozenPiles:[],phase:"play",winner:null,
+    log:["🎮 Tīmata! Raupatu begins.","📖 Steal freely OR place 1 · Stolen piles can't be topped"],
+  };
+}
+
+// Storage
+const RKEY = c=>`raupatu-room-${c}`;
+async function loadRoom(c){ try{ const r=await window.storage.get(RKEY(c),true); return r?JSON.parse(r.value):null; }catch{return null;} }
+async function saveRoom(c,room){ try{ await window.storage.set(RKEY(c),JSON.stringify(room),true); return true; }catch{return false;} }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// METAMASK HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+const STAKE_OPTIONS = [1, 2, 5, 10, 20, 50, 100]; // USD
+
+async function connectWallet(){
+  if(!window.ethereum) throw new Error("MetaMask not installed. Please install it at metamask.io");
+  const accounts = await window.ethereum.request({method:"eth_requestAccounts"});
+  return accounts[0];
+}
+async function getBalance(addr){
+  const hex = await window.ethereum.request({method:"eth_getBalance",params:[addr,"latest"]});
+  return (parseInt(hex,16)/1e18).toFixed(4);
+}
+async function getChain(){
+  const hex = await window.ethereum.request({method:"eth_chainId"});
+  const id = parseInt(hex,16);
+  return {1:"Ethereum",137:"Polygon",56:"BSC",8453:"Base",10:"Optimism",42161:"Arbitrum",11155111:"Sepolia"}[id]||`Chain ${id}`;
+}
+async function getEthPrice(){
+  try{
+    const r = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd");
+    const d = await r.json();
+    return d?.ethereum?.usd || 3000;
+  }catch{ return 3000; } // fallback if fetch blocked
+}
+function usdToWeiHex(usd, ethPriceUsd){
+  const eth = usd / ethPriceUsd;
+  const wei = BigInt(Math.round(eth * 1e18));
+  return "0x" + wei.toString(16);
+}
+async function sendStake(fromAddr, toAddr, usd, ethPrice){
+  const value = usdToWeiHex(usd, ethPrice);
+  const txHash = await window.ethereum.request({
+    method:"eth_sendTransaction",
+    params:[{from:fromAddr, to:toAddr, value, gas:"0x5208"}],
+  });
+  return txHash;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CARD VISUAL
+// ═══════════════════════════════════════════════════════════════════════════
+function PCard({card,faceDown,risen,greenGlow,blueGlow,onClick,tiny}){
+  const W=tiny?36:58,H=tiny?52:84;
+  if(faceDown)return(
+    <div onClick={onClick} style={{width:W,height:H,flexShrink:0,borderRadius:9,border:"3px solid #78350f",
+      cursor:onClick?"pointer":"default",background:"linear-gradient(135deg,#1a3a5c,#0c1e38)",
+      boxShadow:"0 3px 10px rgba(0,0,0,.6)",position:"relative",overflow:"hidden"}}>
+      <div style={{position:"absolute",inset:3,borderRadius:6,border:"2px solid rgba(147,197,253,.18)"}}/>
+      <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:tiny?13:20,opacity:.18}}>🌀</div>
+    </div>
+  );
+  const isRed=RED.has(card.s);
+  const bc=risen?"#f59e0b":greenGlow?"#10b981":blueGlow?"#3b82f6":"#78350f";
+  const sh=risen?"0 0 18px 6px rgba(245,158,11,.85),0 10px 22px rgba(0,0,0,.5)":greenGlow?"0 0 14px 5px rgba(16,185,129,.8),0 4px 10px rgba(0,0,0,.4)":blueGlow?"0 0 12px 4px rgba(59,130,246,.7),0 4px 10px rgba(0,0,0,.4)":"0 3px 10px rgba(0,0,0,.45)";
+  return(
+    <div onClick={onClick} style={{width:W,height:H,flexShrink:0,cursor:onClick?"pointer":"default",userSelect:"none",
+      background:"linear-gradient(160deg,#fffdf0 55%,#f5e8c0 100%)",borderRadius:9,border:`3px solid ${bc}`,boxShadow:sh,
+      transform:risen?"translateY(-14px) rotate(-3deg)":"none",transition:"transform .15s,box-shadow .15s,border-color .15s",
+      display:"flex",flexDirection:"column",justifyContent:"space-between",padding:tiny?3:5,position:"relative"}}>
+      <div style={{fontWeight:900,lineHeight:1.15,fontSize:tiny?9:12,color:isRed?"#dc2626":"#111"}}><div>{card.r}</div><div>{card.s}</div></div>
+      <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",fontSize:tiny?18:26,opacity:.13,pointerEvents:"none"}}>{card.s}</div>
+      <div style={{fontWeight:900,lineHeight:1.15,fontSize:tiny?9:12,color:isRed?"#dc2626":"#111",transform:"rotate(180deg)",alignSelf:"flex-end"}}><div>{card.r}</div><div>{card.s}</div></div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLAYER BOX
+// ═══════════════════════════════════════════════════════════════════════════
+function PlayerBox({player,isActiveTurn,selCard,mode,frozenPiles,myPid,onClick}){
+  const C=SEAT[player.id%4]; const top=topOf(player.pile);
+  const frozen=frozenPiles.includes(player.id),isOpp=player.id!==myPid;
+  const matches=selCard&&top&&top.r===selCard.r;
+  const canSteal=selCard&&matches&&isOpp&&mode!=="place"&&!frozen;
+  const canPlace=selCard&&!frozen&&mode!=="steal"&&!(matches&&isOpp);
+  const blocked=selCard&&frozen; const clickable=canSteal||canPlace;
+  const glow=canSteal?"0 0 20px 7px rgba(16,185,129,.8),0 0 0 2px #10b981":canPlace?"0 0 16px 6px rgba(59,130,246,.65),0 0 0 2px #3b82f6":blocked?"0 0 14px 5px rgba(220,38,38,.5)":isActiveTurn?"0 0 10px 4px rgba(251,191,36,.3)":"none";
+  return(
+    <div onClick={clickable?onClick:undefined} style={{background:C.bg,borderRadius:16,padding:"8px 10px",
+      border:blocked?"3px solid #dc2626":`3px solid ${C.ring}`,cursor:clickable?"pointer":"default",
+      display:"flex",flexDirection:"column",alignItems:"center",gap:5,boxShadow:glow,
+      transition:"box-shadow .2s,border-color .2s",minWidth:88,position:"relative"}}>
+      {isActiveTurn&&<div style={{position:"absolute",top:-9,left:"50%",transform:"translateX(-50%)",background:"#d97706",borderRadius:8,padding:"1px 8px",fontSize:8,fontWeight:900,color:"#fff",whiteSpace:"nowrap",border:"2px solid #fbbf24"}}>⚡ TURN</div>}
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:10,fontWeight:700,color:C.label}}>{player.name}</div>
+        <div style={{fontSize:20,fontWeight:900,color:"#34d399",lineHeight:1}}>{player.hand.length}</div>
+        <div style={{fontSize:7,color:"#6b7280"}}>in hand</div>
+      </div>
+      <div style={{position:"relative"}}>
+        {top?<PCard card={top} tiny greenGlow={canSteal} blueGlow={canPlace&&!canSteal} onClick={clickable?onClick:undefined}/>
+          :<div style={{width:36,height:52,borderRadius:8,border:"2px dashed rgba(255,255,255,.2)",display:"flex",alignItems:"center",justifyContent:"center",color:"rgba(255,255,255,.25)",fontSize:18}}>+</div>}
+        {(canSteal||canPlace)&&<div style={{position:"absolute",inset:-3,borderRadius:11,pointerEvents:"none",boxShadow:canSteal?"0 0 18px 8px rgba(16,185,129,.85)":"0 0 14px 6px rgba(59,130,246,.75)",animation:"gpulse 1s ease-in-out infinite"}}/>}
+        {blocked&&<div style={{position:"absolute",inset:0,borderRadius:8,pointerEvents:"none",background:"rgba(220,38,38,.35)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>🚫</div>}
+      </div>
+      <div style={{fontSize:8,color:"#fcd34d"}}>{player.pile.length} in pile</div>
+    </div>
+  );
+}
+
+function GameLog({lines}){
+  const ref=useRef();
+  useEffect(()=>{if(ref.current)ref.current.scrollTop=ref.current.scrollHeight;},[lines]);
+  return(<div ref={ref} style={{height:56,overflowY:"auto",borderRadius:10,border:"2px solid #78350f",background:"rgba(0,0,0,.7)",padding:"4px 8px",fontFamily:"monospace",fontSize:9.5}}>
+    {lines.map((l,i)=><div key={i} style={{color:"#fef3c7",lineHeight:1.55}}>{l}</div>)}
+  </div>);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RULES MODAL
+// ═══════════════════════════════════════════════════════════════════════════
+function RulesModal({onClose}){
+  const rules=[
+    {icon:"🎯",title:"Objective",body:"Steal as many cards as possible. When the deck runs out and hands are empty, the player with the most cards in their pile wins."},
+    {icon:"🃏",title:"Hand Limit",body:"Each player holds up to 3 cards. Draw back exactly as many as you used each turn."},
+    {icon:"⚖️",title:"Matching",body:"Match by RANK only — suits don't matter. Any 7 steals any pile showing a 7 on top."},
+    {icon:"🔥",title:"Steal Freely",body:"Play as many steal actions as you have matching cards. Each steal uses 1 card from your hand and takes the entire pile, stacking it on yours."},
+    {icon:"📤",title:"Place 1",body:"Alternatively, place 1 card on any pile. Placing ends your turn immediately. You cannot steal and place in the same turn."},
+    {icon:"🚫",title:"Stolen Pile Rule",body:"A pile that was stolen this turn cannot have a card placed on top of it during that same turn."},
+    {icon:"↩️",title:"Draw Back",body:"At end of turn: draw back exactly as many cards as you used (steals + 1 if you placed). This keeps the hand dynamic."},
+    {icon:"🏆",title:"Winning",body:"Game ends when the deck is empty and all hands are empty. Player with the most cards in their pile wins."},
+    {icon:"💰",title:"Buy-In",body:"Premium rooms support $1, $2, $5, $10, $20, $50, or $100 MetaMask stakes. The host sets the amount; all players match it. Winner takes the entire pool."},
+  ];
+  return(
+    <div style={{position:"fixed",inset:0,zIndex:300,background:"rgba(0,0,0,.92)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{maxWidth:480,width:"100%",maxHeight:"85vh",overflowY:"auto",borderRadius:24,border:"3px solid #C9A84C",background:"linear-gradient(160deg,#0c1a0c,#111a08)",padding:"28px 24px"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div>
+            <div style={{fontSize:22,fontWeight:900,color:"#C9A84C",letterSpacing:".15em"}}>✦ NGĀ TURE ✦</div>
+            <div style={{fontSize:9,color:"#fbbf24",letterSpacing:".2em"}}>RULES OF RAUPATU</div>
+          </div>
+          <button onClick={onClose} style={{background:"rgba(255,255,255,.08)",border:"none",color:"#9ca3af",fontSize:20,cursor:"pointer",borderRadius:8,width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+        </div>
+        {rules.map(r=>(
+          <div key={r.title} style={{marginBottom:16,padding:"12px 14px",borderRadius:12,background:"rgba(255,255,255,.04)",border:"1px solid rgba(201,168,76,.2)"}}>
+            <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+              <span style={{fontSize:20,flexShrink:0}}>{r.icon}</span>
+              <div>
+                <div style={{fontSize:12,fontWeight:700,color:"#C9A84C",marginBottom:4}}>{r.title}</div>
+                <div style={{fontSize:11,color:"#d1d5db",lineHeight:1.6}}>{r.body}</div>
+              </div>
+            </div>
+          </div>
+        ))}
+        <div style={{marginTop:16,padding:"10px 14px",borderRadius:12,background:"rgba(201,168,76,.08)",border:"1px solid #C9A84C",textAlign:"center"}}>
+          <div style={{fontSize:11,color:"#fbbf24",fontWeight:700,marginBottom:4}}>📖 Māori Phrases</div>
+          {[["Kei a koe","Your turn"],["Raupatuhia!","Steal it!"],["Kua ōrite","It matches"],["Ko au te toa!","I am the winner!"]].map(([m,e])=>(
+            <div key={m} style={{fontSize:10,color:"#d1d5db",marginTop:2}}><b style={{color:"#fbbf24"}}>{m}</b> — {e}</div>
+          ))}
+        </div>
+        <button onClick={onClose} style={{width:"100%",marginTop:18,padding:"10px",borderRadius:14,fontWeight:900,fontSize:13,border:"3px solid #C9A84C",background:"linear-gradient(135deg,#92400e,#C9A84C)",color:"#fff",cursor:"pointer",fontFamily:"inherit"}}>
+          Kia ora! Close Rules
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN MENU
+// ═══════════════════════════════════════════════════════════════════════════
+function MainMenu({onFree,onPremium,onRules,onTutorial}){
+  const [hover,setHover]=useState(null);
+  const cards=[
+    {id:"rules",icon:"📖",title:"Ngā Ture",sub:"Rules & Guide",color:"#C9A84C",glow:"rgba(201,168,76,.4)",onClick:onRules},
+    {id:"tutorial",icon:"🎓",title:"Tutorial",sub:"Learn vs AI",color:"#7c3aed",glow:"rgba(124,58,237,.4)",onClick:onTutorial},
+    {id:"free",icon:"🎮",title:"Free Play",sub:"Create or join rooms",color:"#059669",glow:"rgba(5,150,105,.4)",onClick:onFree},
+    {id:"premium",icon:"💰",title:"Premium",sub:"$1–$100 MetaMask stake",color:"#be123c",glow:"rgba(190,18,60,.4)",onClick:onPremium},
+  ];
+
+  return(
+    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,gap:32,position:"relative",overflow:"hidden"}}>
+      {/* animated background cards */}
+      {[{r:"K",s:"♠",top:"8%",left:"5%",rot:"-15deg"},{r:"A",s:"♥",top:"12%",right:"6%",rot:"12deg"},{r:"Q",s:"♦",bottom:"15%",left:"4%",rot:"20deg"},{r:"J",s:"♣",bottom:"18%",right:"5%",rot:"-10deg"}].map((c,i)=>(
+        <div key={i} style={{position:"absolute",top:c.top,bottom:c.bottom,left:c.left,right:c.right,
+          width:52,height:74,borderRadius:8,border:"2px solid rgba(201,168,76,.15)",
+          background:"rgba(255,253,240,.04)",display:"flex",flexDirection:"column",
+          justifyContent:"space-between",padding:4,transform:`rotate(${c.rot})`,
+          animation:`float${i} ${3+i*.5}s ease-in-out infinite`,pointerEvents:"none"}}>
+          <div style={{fontSize:11,fontWeight:900,color:RED.has(c.s)?"rgba(220,38,38,.3)":"rgba(17,17,17,.3)"}}><div>{c.r}</div><div>{c.s}</div></div>
+          <div style={{fontSize:22,textAlign:"center",opacity:.06}}>{c.s}</div>
+        </div>
+      ))}
+
+      {/* title */}
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:48,fontWeight:900,letterSpacing:".18em",color:"#C9A84C",
+          textShadow:"0 0 30px rgba(201,168,76,.8),0 0 60px rgba(201,168,76,.3),4px 4px 0 #4a0000",
+          animation:"titlePulse 3s ease-in-out infinite"}}>✦ RAUPATU ✦</div>
+        <div style={{fontSize:11,color:"#a16207",letterSpacing:".3em",marginTop:4}}>NGERI TĀHAE KĀRI</div>
+        <div style={{fontSize:9,color:"#78350f",letterSpacing:".2em",marginTop:2}}>THE CARD STEALING GAME · 2–4 PLAYERS</div>
+      </div>
+
+      {/* menu cards */}
+      <div style={{display:"flex",gap:16,flexWrap:"wrap",justifyContent:"center",width:"100%",maxWidth:600}}>
+        {cards.map(c=>(
+          <div key={c.id}
+            onMouseEnter={()=>setHover(c.id)}
+            onMouseLeave={()=>setHover(null)}
+            onClick={c.onClick}
+            style={{
+              flex:1,minWidth:150,maxWidth:180,
+              padding:"28px 18px",borderRadius:22,cursor:"pointer",
+              border:`2px solid ${hover===c.id?c.color:"rgba(255,255,255,.1)"}`,
+              background:hover===c.id?`linear-gradient(160deg,${c.color}22,${c.color}08)`:"rgba(0,0,0,.5)",
+              boxShadow:hover===c.id?`0 0 30px 8px ${c.glow},0 8px 24px rgba(0,0,0,.5)`:"0 4px 16px rgba(0,0,0,.4)",
+              transform:hover===c.id?"translateY(-6px) scale(1.02)":"none",
+              transition:"all .2s ease",
+              display:"flex",flexDirection:"column",alignItems:"center",gap:12,textAlign:"center",
+            }}>
+            <div style={{fontSize:40}}>{c.icon}</div>
+            <div>
+              <div style={{fontSize:16,fontWeight:900,color:hover===c.id?c.color:"#fef3c7",letterSpacing:".08em"}}>{c.title}</div>
+              <div style={{fontSize:10,color:"#9ca3af",marginTop:3}}>{c.sub}</div>
+            </div>
+            <div style={{width:40,height:2,borderRadius:1,background:hover===c.id?c.color:"rgba(255,255,255,.1)",transition:"all .2s"}}/>
+          </div>
+        ))}
+      </div>
+
+      {/* bottom tagline */}
+      <div style={{textAlign:"center",fontSize:9,color:"#4a3020",letterSpacing:".15em"}}>
+        KL-1.0 KAITIAKI LICENCE · OK SHAQ RECORDS · AOTEAROA
+      </div>
+
+      <style>{`
+        @keyframes titlePulse{0%,100%{text-shadow:0 0 30px rgba(201,168,76,.8),4px 4px 0 #4a0000}50%{text-shadow:0 0 50px rgba(201,168,76,1),0 0 80px rgba(201,168,76,.4),4px 4px 0 #4a0000}}
+        @keyframes float0{0%,100%{transform:rotate(-15deg) translateY(0)}50%{transform:rotate(-15deg) translateY(-8px)}}
+        @keyframes float1{0%,100%{transform:rotate(12deg) translateY(0)}50%{transform:rotate(12deg) translateY(-6px)}}
+        @keyframes float2{0%,100%{transform:rotate(20deg) translateY(0)}50%{transform:rotate(20deg) translateY(-10px)}}
+        @keyframes float3{0%,100%{transform:rotate(-10deg) translateY(0)}50%{transform:rotate(-10deg) translateY(-7px)}}
+      `}</style>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FREE LOBBY
+// ═══════════════════════════════════════════════════════════════════════════
+function FreeLobby({onBack,onEnterRoom}){
+  const [name,setName]=useState(""); const [code,setCode]=useState(""); const [err,setErr]=useState(""); const [busy,setBusy]=useState(false);
+  async function doHost(){
+    const n=name.trim(); if(!n)return setErr("Enter your name"); setBusy(true); setErr("");
+    const c=randCode();
+    const room={code:c,seats:[{pid:0,name:n,joined:true},null,null,null],started:false,hostPid:0,game:null,premium:false};
+    await saveRoom(c,room); onEnterRoom({code:c,myPid:0,myName:n,premium:false}); setBusy(false);
+  }
+  async function doJoin(){
+    const n=name.trim(),c=code.trim().toUpperCase(); if(!n)return setErr("Enter your name"); if(c.length<4)return setErr("Enter room code");
+    setBusy(true); setErr(""); const room=await loadRoom(c);
+    if(!room)return(setBusy(false),setErr("Room not found"));
+    if(room.started)return(setBusy(false),setErr("Game already started"));
+    const slot=room.seats.findIndex(s=>s===null); if(slot===-1)return(setBusy(false),setErr("Room full"));
+    room.seats[slot]={pid:slot,name:n,joined:true}; await saveRoom(c,room);
+    onEnterRoom({code:c,myPid:slot,myName:n,premium:false}); setBusy(false);
+  }
+  return(
+    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,gap:16}}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:26,fontWeight:900,color:"#059669",textShadow:"0 0 20px rgba(5,150,105,.5)"}}>🎮 Free Rooms</div>
+        <div style={{fontSize:10,color:"#6b7280",marginTop:4}}>No buy-in · Play for fun</div>
+      </div>
+      <div style={{width:"100%",maxWidth:340,display:"flex",flexDirection:"column",gap:10}}>
+        <input value={name} onChange={e=>setName(e.target.value.slice(0,16))} placeholder="Your name…"
+          style={{width:"100%",padding:"10px 14px",borderRadius:12,fontSize:14,border:"2px solid #059669",background:"rgba(0,0,0,.6)",color:"#fef3c7",fontFamily:"Georgia,serif",outline:"none",boxSizing:"border-box"}}/>
+        <button onClick={doHost} disabled={busy} style={{padding:"12px",borderRadius:14,fontWeight:900,fontSize:15,border:"3px solid #059669",background:"linear-gradient(135deg,#065f46,#047857)",color:"#fff",cursor:"pointer",fontFamily:"inherit"}}>
+          🏠 Create Room
+        </button>
+        <div style={{display:"flex",gap:8}}>
+          <input value={code} onChange={e=>setCode(e.target.value.toUpperCase())} placeholder="Room code…" maxLength={4}
+            style={{flex:1,padding:"10px 14px",borderRadius:12,fontSize:14,border:"2px solid #78350f",background:"rgba(0,0,0,.6)",color:"#fef3c7",fontFamily:"Georgia,serif",outline:"none"}}/>
+          <button onClick={doJoin} disabled={busy} style={{padding:"10px 16px",borderRadius:12,fontWeight:900,fontSize:13,border:"3px solid #be123c",background:"linear-gradient(135deg,#9f1239,#be123c)",color:"#fff",cursor:"pointer",fontFamily:"inherit"}}>
+            Join →
+          </button>
+        </div>
+        {err&&<div style={{color:"#f87171",fontSize:11,textAlign:"center"}}>{err}</div>}
+      </div>
+      <button onClick={onBack} style={{padding:"8px 20px",borderRadius:12,fontWeight:700,fontSize:12,border:"2px solid #6b7280",background:"rgba(0,0,0,.5)",color:"#9ca3af",cursor:"pointer",fontFamily:"inherit"}}>← Back</button>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PREMIUM LOBBY (MetaMask)
+// ═══════════════════════════════════════════════════════════════════════════
+function PremiumLobby({onBack,onEnterRoom}){
+  const [name,    setName]    = useState("");
+  const [wallet,  setWallet]  = useState(null);   // {addr, balance, chain}
+  const [ethPrice,setEthPrice]= useState(null);   // USD per ETH (live)
+  const [stake,   setStake]   = useState(1);      // selected USD amount
+  const [code,    setCode]    = useState("");
+  const [err,     setErr]     = useState("");
+  const [busy,    setBusy]    = useState(false);
+  const [txStatus,setTxStatus]= useState(null);   // null | "pending" | "done"
+
+  // Fetch ETH price once on mount
+  useEffect(()=>{ getEthPrice().then(setEthPrice); },[]);
+
+  const ethEquiv = ethPrice ? (stake/ethPrice).toFixed(6) : "…";
+  const addrShort = wallet ? `${wallet.addr.slice(0,6)}…${wallet.addr.slice(-4)}` : "";
+
+  async function connect(){
+    setErr("");
+    try{
+      const addr = await connectWallet();
+      const [bal, chain, price] = await Promise.all([getBalance(addr), getChain(), getEthPrice()]);
+      setWallet({addr,balance:bal,chain});
+      setEthPrice(price);
+    }catch(e){ setErr(e.message||"Connection failed"); }
+  }
+
+  async function doHost(){
+    const n = name.trim();
+    if(!n)  return setErr("Enter your name");
+    if(!wallet) return setErr("Connect wallet first");
+    setBusy(true); setErr(""); setTxStatus("pending");
+    try{
+      const c = randCode();
+      const room = {
+        code:c, started:false, hostPid:0, game:null, premium:true,
+        stakeUsd: stake, treasury: wallet.addr, pool: stake,
+        seats: [{pid:0,name:n,addr:wallet.addr,joined:true,paid:true}, null, null, null],
+      };
+      await saveRoom(c, room);
+      setTxStatus("done");
+      onEnterRoom({code:c, myPid:0, myName:n, premium:true, stakeUsd:stake, treasury:wallet.addr});
+    }catch(e){ setErr(e.message||"Failed"); setTxStatus(null); }
+    setBusy(false);
+  }
+
+  async function doJoin(){
+    const n = name.trim(), c = code.trim().toUpperCase();
+    if(!n)        return setErr("Enter your name");
+    if(c.length<4) return setErr("Enter the 4-letter room code");
+    if(!wallet)   return setErr("Connect wallet first");
+    setBusy(true); setErr("");
+    const room = await loadRoom(c);
+    if(!room)           return setBusy(false)||setErr("Room not found");
+    if(!room.premium)   return setBusy(false)||setErr("Not a premium room");
+    if(room.started)    return setBusy(false)||setErr("Game already started");
+    const slot = room.seats.findIndex(s=>s===null);
+    if(slot===-1)       return setBusy(false)||setErr("Room is full");
+    const roomStake = room.stakeUsd || 1;
+    setStake(roomStake); // match host's stake
+    setTxStatus("pending");
+    try{
+      const price = ethPrice || await getEthPrice();
+      const txHash = await sendStake(wallet.addr, room.treasury, roomStake, price);
+      room.seats[slot] = {pid:slot, name:n, addr:wallet.addr, joined:true, paid:true, txHash};
+      room.pool = (room.pool||0) + roomStake;
+      await saveRoom(c, room);
+      setTxStatus("done");
+      onEnterRoom({code:c, myPid:slot, myName:n, premium:true, stakeUsd:roomStake, treasury:room.treasury});
+    }catch(e){ setErr(e.message||"Transaction failed or rejected"); setTxStatus(null); }
+    setBusy(false);
+  }
+
+  const inp = (val,set,ph,maxLen,extra={})=>(
+    <input value={val} onChange={e=>set(e.target.value.slice(0,maxLen||32))} placeholder={ph}
+      style={{width:"100%",padding:"10px 14px",borderRadius:12,fontSize:14,
+        border:"2px solid #be123c",background:"rgba(0,0,0,.6)",color:"#fef3c7",
+        fontFamily:"Georgia,serif",outline:"none",boxSizing:"border-box",...extra}}/>
+  );
+
+  return(
+    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",
+      justifyContent:"center",padding:"24px 16px",gap:16,overflowY:"auto"}}>
+
+      {/* Title */}
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:26,fontWeight:900,color:"#be123c",textShadow:"0 0 20px rgba(190,18,60,.5)"}}>
+          💰 Premium Rooms
+        </div>
+        <div style={{fontSize:10,color:"#6b7280",marginTop:4}}>
+          MetaMask buy-in · Winner takes the pool
+        </div>
+      </div>
+
+      {/* Wallet Panel */}
+      <div style={{width:"100%",maxWidth:380,borderRadius:18,border:"2px solid #be123c",
+        background:"rgba(60,0,16,.7)",padding:"16px 18px"}}>
+        <div style={{fontSize:10,color:"#fda4af",fontWeight:700,marginBottom:10,letterSpacing:".1em"}}>
+          💳 WALLET
+        </div>
+        {!wallet ? (
+          <button onClick={connect} style={{width:"100%",padding:"13px",borderRadius:12,
+            fontWeight:900,fontSize:14,border:"3px solid #f97316",
+            background:"linear-gradient(135deg,#c2410c,#ea580c)",
+            color:"#fff",cursor:"pointer",fontFamily:"inherit",
+            display:"flex",alignItems:"center",justifyContent:"center",gap:10}}>
+            <span style={{fontSize:22}}>🦊</span> Connect MetaMask
+          </button>
+        ):(
+          <div style={{display:"flex",flexDirection:"column",gap:7}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{fontSize:11,color:"#fda4af",fontWeight:700}}>🦊 {addrShort}</div>
+              <div style={{fontSize:9,color:"#6b7280",background:"rgba(0,0,0,.4)",padding:"2px 8px",borderRadius:8}}>{wallet.chain}</div>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between",borderTop:"1px solid rgba(255,255,255,.06)",paddingTop:6}}>
+              <div style={{fontSize:11,color:"#9ca3af"}}>Balance</div>
+              <div style={{fontSize:13,fontWeight:700,color:"#fbbf24"}}>{wallet.balance} ETH</div>
+            </div>
+            <div style={{display:"flex",justifyContent:"space-between"}}>
+              <div style={{fontSize:11,color:"#9ca3af"}}>ETH/USD</div>
+              <div style={{fontSize:11,color:"#6b7280"}}>{ethPrice ? `$${ethPrice.toLocaleString()}` : "fetching…"}</div>
+            </div>
+            {txStatus==="pending" && (
+              <div style={{textAlign:"center",fontSize:10,color:"#fbbf24",padding:"6px",
+                borderRadius:8,background:"rgba(251,191,36,.1)",animation:"gpulse 1s infinite"}}>
+                ⏳ Transaction pending in MetaMask…
+              </div>
+            )}
+            {txStatus==="done" && (
+              <div style={{textAlign:"center",fontSize:10,color:"#34d399",padding:"6px",
+                borderRadius:8,background:"rgba(52,211,153,.1)"}}>
+                ✅ Staked — entering room
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Stake Selector */}
+      <div style={{width:"100%",maxWidth:380}}>
+        <div style={{fontSize:10,color:"#fda4af",fontWeight:700,marginBottom:8,letterSpacing:".1em"}}>
+          🎰 SELECT BUY-IN AMOUNT
+        </div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          {STAKE_OPTIONS.map(amt=>{
+            const sel = stake===amt;
+            return(
+              <button key={amt} onClick={()=>setStake(amt)} style={{
+                flex:"1 1 calc(25% - 6px)", minWidth:56,
+                padding:"10px 4px", borderRadius:12, fontWeight:900, fontSize:13,
+                border: sel ? "2px solid #fbbf24" : "2px solid rgba(255,255,255,.12)",
+                background: sel
+                  ? "linear-gradient(135deg,#92400e,#d97706)"
+                  : "rgba(0,0,0,.45)",
+                color: sel ? "#fff" : "#9ca3af",
+                cursor:"pointer", fontFamily:"inherit",
+                boxShadow: sel ? "0 0 12px 3px rgba(251,191,36,.4)" : "none",
+                transition:"all .15s",
+                display:"flex",flexDirection:"column",alignItems:"center",gap:1,
+              }}>
+                <span style={{fontSize:14}}>${amt}</span>
+                <span style={{fontSize:8,opacity:.7,color:sel?"#fef3c7":"#6b7280"}}>
+                  {ethPrice ? `≈${(amt/ethPrice).toFixed(5)} ETH` : "…"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        {/* Selected stake summary */}
+        <div style={{marginTop:10,padding:"8px 14px",borderRadius:12,
+          background:"rgba(201,168,76,.08)",border:"1px solid rgba(201,168,76,.3)",
+          display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontSize:11,color:"#fbbf24",fontWeight:700}}>Selected buy-in</div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:16,fontWeight:900,color:"#fbbf24"}}>${stake}</div>
+            <div style={{fontSize:9,color:"#a16207"}}>{ethEquiv} ETH</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Name + Action Buttons */}
+      <div style={{width:"100%",maxWidth:380,display:"flex",flexDirection:"column",gap:10}}>
+        {inp(name,setName,"Your name…",16)}
+
+        <button onClick={doHost} disabled={busy||!wallet} style={{
+          padding:"13px",borderRadius:14,fontWeight:900,fontSize:14,
+          border:"3px solid #be123c",
+          background:"linear-gradient(135deg,#9f1239,#be123c)",
+          color:"#fff",cursor:wallet?"pointer":"not-allowed",fontFamily:"inherit",
+          opacity:wallet?1:.45,
+          boxShadow:wallet?"0 0 16px 4px rgba(190,18,60,.35)":"none",
+        }}>
+          🏠 Host Room — ${stake} buy-in
+        </button>
+
+        <div style={{display:"flex",gap:8}}>
+          {inp(code,c=>setCode(c.toUpperCase()),"Room code (e.g. AB12)",4,{
+            border:"2px solid #78350f",flex:1,
+          })}
+          <button onClick={doJoin} disabled={busy||!wallet} style={{
+            flexShrink:0,padding:"10px 16px",borderRadius:12,fontWeight:900,fontSize:13,
+            border:"3px solid #7c3aed",background:"linear-gradient(135deg,#4c1d95,#7c3aed)",
+            color:"#fff",cursor:wallet?"pointer":"not-allowed",fontFamily:"inherit",
+            opacity:wallet?1:.45,
+          }}>
+            Stake &amp; Join →
+          </button>
+        </div>
+
+        {err && (
+          <div style={{color:"#f87171",fontSize:11,textAlign:"center",padding:"6px 10px",
+            borderRadius:10,background:"rgba(220,38,38,.1)",border:"1px solid rgba(220,38,38,.3)"}}>
+            ⚠️ {err}
+          </div>
+        )}
+
+        <div style={{fontSize:9,color:"#4a3020",textAlign:"center",lineHeight:1.6}}>
+          The host's wallet holds the prize pool.<br/>
+          For trustless escrow, a smart contract is required in production.<br/>
+          Joining sends exactly {ethEquiv} ETH to the host wallet.
+        </div>
+      </div>
+
+      <button onClick={onBack} style={{padding:"8px 20px",borderRadius:12,fontWeight:700,fontSize:12,
+        border:"2px solid #6b7280",background:"rgba(0,0,0,.5)",color:"#9ca3af",cursor:"pointer",fontFamily:"inherit"}}>
+        ← Back
+      </button>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WAITING ROOM
+// ═══════════════════════════════════════════════════════════════════════════
+function WaitingRoom({session,onStart,onLeave}){
+  const {code,myPid,premium}=session;
+  const [room,setRoom]=useState(null); const [err,setErr]=useState(""); const [busy,setBusy]=useState(false);
+  useEffect(()=>{
+    const tick=async()=>{ const r=await loadRoom(code); if(r){setRoom(r); if(r.started&&r.game)onStart(r.game);} };
+    tick(); const id=setInterval(tick,2000); return()=>clearInterval(id);
+  },[code]);
+  async function startGame(){
+    const r=await loadRoom(code); if(!r)return setErr("Room gone");
+    const names=r.seats.filter(Boolean).map(s=>s.name); if(names.length<2)return setErr("Need 2+ players");
+    const game=freshGame(names); r.started=true; r.game=game; setBusy(true);
+    await saveRoom(code,r); onStart(game); setBusy(false);
+  }
+  const seats=room?room.seats:[null,null,null,null];
+  const filled=seats.filter(Boolean);
+  const pool=room?.pool||0;
+  return(
+    <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,gap:16}}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:22,fontWeight:900,color:premium?"#be123c":"#059669",textShadow:`0 0 20px ${premium?"rgba(190,18,60,.5)":"rgba(5,150,105,.5)"}`}}>
+          {premium?"💰 Premium Room":"🎮 Free Room"}
+        </div>
+        {premium&&<div style={{fontSize:13,color:"#34d399",marginTop:4}}>Prize Pool: ${pool} USDT equiv.</div>}
+      </div>
+      {/* code display */}
+      <div style={{textAlign:"center",padding:"14px 32px",borderRadius:20,border:"3px solid #C9A84C",background:"rgba(0,0,0,.7)"}}>
+        <div style={{fontSize:11,color:"#a16207",marginBottom:4}}>Share this code</div>
+        <div style={{fontSize:44,fontWeight:900,letterSpacing:".3em",color:"#fbbf24",textShadow:"0 0 20px rgba(251,191,36,.6)"}}>{code}</div>
+      </div>
+      {/* seats */}
+      <div style={{width:"100%",maxWidth:340,display:"flex",flexDirection:"column",gap:8}}>
+        {[0,1,2,3].map(i=>{
+          const s=seats[i];
+          return(<div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 14px",borderRadius:12,border:`2px solid ${s?SEAT[i].ring:"rgba(255,255,255,.1)"}`,background:s?SEAT[i].bg:"rgba(0,0,0,.3)"}}>
+            <div style={{width:28,height:28,borderRadius:14,background:s?SEAT[i].ring:"rgba(255,255,255,.1)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:13,fontWeight:900,color:"#fff"}}>{i+1}</div>
+            <div style={{flex:1}}>
+              <div style={{fontSize:13,fontWeight:700,color:s?SEAT[i].label:"#6b7280"}}>{s?s.name:"Waiting…"}</div>
+              {i===0&&s&&<div style={{fontSize:9,color:"#a16207"}}>Host {premium&&"· Holds pool"}</div>}
+              {s&&s.pid===myPid&&<div style={{fontSize:9,color:"#34d399"}}>← You</div>}
+              {premium&&s?.paid&&<div style={{fontSize:8,color:"#34d399"}}>✅ Staked</div>}
+            </div>
+            {s&&<div style={{fontSize:16}}>✓</div>}
+          </div>);
+        })}
+      </div>
+      {err&&<div style={{color:"#f87171",fontSize:11}}>{err}</div>}
+      <div style={{display:"flex",gap:10}}>
+        {myPid===0&&(
+          <button onClick={startGame} disabled={busy||filled.length<2} style={{padding:"12px 28px",borderRadius:16,fontWeight:900,fontSize:15,border:"3px solid #fbbf24",background:"linear-gradient(135deg,#92400e,#d97706)",color:"#fff",cursor:filled.length<2?"not-allowed":"pointer",fontFamily:"inherit",opacity:(busy||filled.length<2)?.5:1,boxShadow:"0 0 14px 4px rgba(251,191,36,.3)"}}>
+            🎮 Start ({filled.length}/4)
+          </button>
+        )}
+        {myPid!==0&&<div style={{fontSize:11,color:"#a16207",padding:"10px 20px",borderRadius:12,border:"1px solid #78350f",background:"rgba(0,0,0,.4)"}}>⏳ Waiting for host…</div>}
+        <button onClick={onLeave} style={{padding:"10px 18px",borderRadius:14,fontWeight:700,fontSize:12,border:"2px solid #6b7280",background:"rgba(0,0,0,.5)",color:"#9ca3af",cursor:"pointer",fontFamily:"inherit"}}>← Leave</button>
+      </div>
+      <div style={{fontSize:9,color:"#6b7280"}}>Polling every 2s…</div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GAME TABLE
+// ═══════════════════════════════════════════════════════════════════════════
+function GameTable({initGame,session,onLeave}){
+  const {code,myPid,premium}=session;
+  const [G,setGLocal]=useState(initGame);
+  const GRef=useRef(G); GRef.current=G;
+  const [syncing,setSyncing]=useState(false);
+  const myTurn=G.turn===myPid&&G.phase==="play";
+
+  const pushState=useCallback(async newG=>{
+    setSyncing(true);
+    try{ const room=await loadRoom(code); if(room){room.game=newG;await saveRoom(code,room);} }catch{}
+    setSyncing(false);
+  },[code]);
+
+  useEffect(()=>{
+    if(myTurn)return;
+    const id=setInterval(async()=>{
+      const room=await loadRoom(code); if(!room?.game)return; const remote=room.game;
+      if(remote.turn!==GRef.current.turn||remote.phase!==GRef.current.phase||JSON.stringify(remote.log)!==JSON.stringify(GRef.current.log))
+        setGLocal(remote);
+    },2000);
+    return()=>clearInterval(id);
+  },[code,myTurn]);
+
+  function apply(fn){ setGLocal(prev=>{ const next=fn(prev); pushState(next); return next; }); }
+
+  function selectCard(i){ if(!myTurn||G.mode==="place")return; setGLocal(g=>({...g,sel:g.sel===i?null:i})); }
+
+  function clickBox(targetId){
+    if(!myTurn||G.sel===null)return;
+    apply(prev=>{
+      if(prev.sel===null||prev.sel>=prev.players[myPid].hand.length)return prev;
+      const card=prev.players[myPid].hand[prev.sel];
+      const target=prev.players[targetId]; const top=topOf(target.pile);
+      const frozen=prev.frozenPiles.includes(targetId),isOpp=targetId!==myPid;
+      const matches=top&&top.r===card.r;
+      if(isOpp&&matches&&prev.mode!=="place"&&!frozen){
+        const ps=cloneP(prev.players); ps[myPid].hand.splice(prev.sel,1);
+        const stolen=[...ps[targetId].pile]; ps[myPid].pile=[...ps[myPid].pile,...stolen];
+        ps[targetId].pile=[];
+        return{...prev,players:ps,sel:null,mode:"steal",stealsCount:prev.stealsCount+1,cardsUsed:prev.cardsUsed+1,
+          frozenPiles:[...prev.frozenPiles,targetId],
+          log:[...prev.log,`🔥 ${prev.players[myPid].name} stole ${stolen.length} from ${target.name} with ${card.r}!`]};
+      }
+      if(prev.mode!=="steal"&&!frozen){
+        const ps=cloneP(prev.players); ps[myPid].hand.splice(prev.sel,1); ps[targetId].pile.push(card);
+        const{players:ps2,deck:d2}=fillHand(ps,prev.deck,myPid);
+        const drew=ps2[myPid].hand.length-(ps[myPid].hand.length); // delta
+        return maybeOver(nextTurn({...prev,players:ps2,deck:d2,
+          log:[...prev.log,`📤 ${prev.players[myPid].name} placed ${card.r}${card.s} on ${target.name}'s pile. Drew ${drew} → hand ${ps2[myPid].hand.length}.`]},myPid));
+      }
+      if(frozen)return{...prev,sel:null,log:[...prev.log,`🚫 ${target.name}'s pile was just stolen!`]};
+      return prev;
+    });
+  }
+
+  function doEndTurn(){
+    if(!myTurn||G.mode!=="steal")return;
+    apply(prev=>{
+      const before=prev.players[myPid].hand.length;
+      const{players,deck}=fillHand(prev.players,prev.deck,myPid);
+      const drew=players[myPid].hand.length-before;
+      return maybeOver(nextTurn({...prev,players,deck,
+        log:[...prev.log,`↩️ ${prev.players[myPid].name} ends turn. Drew ${drew} → hand ${players[myPid].hand.length}.`]},myPid));
+    });
+  }
+
+  const me=G.players[myPid],others=G.players.filter(p=>p.id!==myPid);
+  const selCard=G.sel!==null&&G.sel<(me?.hand.length??0)?me.hand[G.sel]:null;
+  const canEnd=myTurn&&G.mode==="steal"&&G.sel===null;
+  function handCardGlows(card){ if(G.mode==="place")return false; return G.players.filter(p=>p.id!==myPid).some(a=>{const t=topOf(a.pile);return t&&t.r===card.r&&!G.frozenPiles.includes(a.id);}); }
+
+  let hint="";
+  if(myTurn){
+    if(selCard){
+      const targets=G.players.filter(p=>p.id!==myPid).filter(a=>{const t=topOf(a.pile);return t&&t.r===selCard.r&&G.mode!=="place"&&!G.frozenPiles.includes(a.id);});
+      if(G.mode==="steal") hint=targets.length?`🔥 Steal from ${targets.map(a=>a.name).join("/")} again — or End Turn to draw to 3`:`No more steal targets — End Turn to draw to 3`;
+      else hint=targets.length?`Kua ōrite! STEAL ${targets.map(a=>a.name).join("/")} 🔥  OR  click any pile to PLACE`:"Click any pile to PLACE (draws to 3, ends turn)";
+    }else if(G.mode==="steal") hint=`${G.stealsCount} steal${G.stealsCount>1?"s":""} done — select card to steal more, or End Turn`;
+    else hint="Your turn — STEAL freely  OR  PLACE 1";
+  }else if(G.phase==="play") hint=`⏳ ${G.players[G.turn]?.name}'s turn…`;
+
+  const prizePool=premium?(G.players.length):0;
+
+  return(
+    <div style={{width:"100%",minHeight:"100vh",display:"flex",flexDirection:"column",fontFamily:"Georgia,serif",userSelect:"none",background:"radial-gradient(ellipse at 50% 35%,#1c4f1c 0%,#0e2d0e 55%,#061406 100%)",position:"relative",overflowX:"hidden"}}>
+      <div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0,backgroundImage:`repeating-linear-gradient(0deg,rgba(255,255,255,.008) 0,rgba(255,255,255,.008) 1px,transparent 1px,transparent 9px),repeating-linear-gradient(90deg,rgba(255,255,255,.008) 0,rgba(255,255,255,.008) 1px,transparent 1px,transparent 9px)`}}/>
+      <div style={{position:"fixed",top:0,inset:"0 0 auto",height:6,zIndex:1,opacity:.5,background:"repeating-linear-gradient(90deg,#8B0000 0,#8B0000 20px,#C9A84C 20px,#C9A84C 40px)"}}/>
+      <div style={{position:"fixed",bottom:0,inset:"auto 0 0",height:6,zIndex:1,opacity:.5,background:"repeating-linear-gradient(90deg,#C9A84C 0,#C9A84C 20px,#8B0000 20px,#8B0000 40px)"}}/>
+
+      {G.phase==="over"&&(
+        <div style={{position:"fixed",inset:0,zIndex:200,background:"rgba(0,0,0,.93)",display:"flex",alignItems:"center",justifyContent:"center"}}>
+          <div style={{textAlign:"center",padding:"36px 44px",borderRadius:28,border:"4px solid #f59e0b",background:"linear-gradient(160deg,#180900,#2c1800)",maxWidth:380}}>
+            <div style={{fontSize:56,marginBottom:12}}>{G.winner===me?.name?"🏆":G.winner==="Tie"?"🤝":"🤖"}</div>
+            <div style={{fontSize:24,fontWeight:900,color:"#fbbf24",marginBottom:10,letterSpacing:".1em"}}>{G.winner===me?.name?"KO AU TE TOA!":G.winner==="Tie"?"HE ŌRITE!":G.winner+" WINS!"}</div>
+            {premium&&G.winner!=="Tie"&&<div style={{fontSize:16,color:"#34d399",fontWeight:700,marginBottom:10}}>💰 Prize Pool: ${prizePool} → {G.winner}</div>}
+            <div style={{color:"#fef3c7",lineHeight:2,fontSize:11,marginBottom:18}}>{G.players.map(p=>`${p.name}: ${p.pile.length} cards`).join("  ·  ")}</div>
+            <button onClick={onLeave} style={{padding:"12px 36px",borderRadius:20,fontWeight:900,fontSize:16,border:"4px solid #f59e0b",background:"linear-gradient(135deg,#991b1b,#d97706)",color:"#fff",cursor:"pointer",fontFamily:"inherit"}}>← Menu</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{position:"relative",zIndex:2,flex:1,display:"flex",flexDirection:"column",padding:"12px 12px 0",paddingBottom:140}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:6}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:900,letterSpacing:".15em",color:"#C9A84C",textShadow:"0 0 16px rgba(201,168,76,.75),3px 3px 0 #4a0000"}}>✦ RAUPATU ✦</div>
+            <div style={{fontSize:8,color:"#fbbf24",letterSpacing:".12em"}}>
+              {premium&&<span style={{color:"#fda4af",marginRight:6}}>💰 PREMIUM · ${prizePool} POOL</span>}
+              ROOM: <b style={{color:"#fff",letterSpacing:".25em"}}>{code}</b>
+              {syncing&&<span style={{color:"#fbbf24",marginLeft:6}}>↑</span>}
+            </div>
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <div style={{fontSize:10,color:"#fcd34d",background:"rgba(0,0,0,.6)",padding:"3px 10px",borderRadius:10,border:"1px solid #78350f"}}>🃏 <b style={{color:"#fff"}}>{G.deck.length}</b></div>
+            <div style={{fontSize:11,fontWeight:700,padding:"3px 12px",borderRadius:12,background:myTurn?"#065f46":"#4a1010",color:myTurn?"#fff":"#fca5a5"}}>{myTurn?"⚡ YOUR TURN":`⏳ ${G.players[G.turn]?.name}…`}</div>
+            <button onClick={onLeave} style={{padding:"3px 10px",borderRadius:8,fontSize:10,fontWeight:700,border:"1px solid #6b7280",background:"rgba(0,0,0,.5)",color:"#9ca3af",cursor:"pointer",fontFamily:"inherit"}}>Leave</button>
+          </div>
+        </div>
+
+        <div style={{display:"flex",justifyContent:"center",gap:14,marginBottom:10}}>
+          {others.map(p=><PlayerBox key={p.id} player={p} isActiveTurn={G.turn===p.id} selCard={myTurn?selCard:null} mode={G.mode} frozenPiles={G.frozenPiles} myPid={myPid} onClick={()=>clickBox(p.id)}/>)}
+        </div>
+
+        <div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:28,flex:1,minHeight:0,paddingBottom:8}}>
+          {me&&<PlayerBox player={me} isActiveTurn={myTurn} selCard={myTurn?selCard:null} mode={G.mode} frozenPiles={G.frozenPiles} myPid={myPid} onClick={()=>clickBox(myPid)}/>}
+          <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:5}}>
+            <div style={{fontSize:9,color:"#fbbf24",fontWeight:700,letterSpacing:".1em"}}>DRAW PILE</div>
+            <div style={{position:"relative",width:66,height:96}}>
+              {G.deck.length>2&&<div style={{position:"absolute",width:58,height:84,top:8,left:8,borderRadius:9,border:"3px solid #78350f",background:"#1a3a5c",zIndex:0}}/>}
+              {G.deck.length>1&&<div style={{position:"absolute",width:58,height:84,top:4,left:4,borderRadius:9,border:"3px solid #78350f",background:"#1c3d62",zIndex:1}}/>}
+              <div style={{position:"absolute",top:0,left:0,zIndex:2}}>{G.deck.length>0?<PCard faceDown/>:<div style={{width:58,height:84,borderRadius:9,border:"2px dashed #a16207",display:"flex",alignItems:"center",justifyContent:"center",color:"#a16207",fontSize:10,opacity:.5}}>EMPTY</div>}</div>
+            </div>
+            <div style={{fontSize:9,color:"#fcd34d"}}>{G.deck.length} cards</div>
+          </div>
+          {myTurn&&G.cardsUsed>0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3}}><div style={{fontSize:8,color:"#9ca3af"}}>THIS TURN</div><div style={{fontSize:24,fontWeight:900,color:"#93c5fd",lineHeight:1}}>{G.cardsUsed}</div><div style={{fontSize:9,color:"#34d399"}}>→draw {G.cardsUsed}</div></div>}
+        </div>
+
+        <div style={{textAlign:"center",minHeight:24,marginBottom:6}}>{hint&&<div style={{display:"inline-block",fontSize:10,color:"#fef3c7",background:"rgba(0,0,0,.7)",padding:"3px 14px",borderRadius:10,border:"1px solid #78350f"}}>{hint}</div>}</div>
+
+        {canEnd&&<div style={{display:"flex",justifyContent:"center",marginBottom:8}}><button onClick={doEndTurn} style={{padding:"9px 28px",borderRadius:18,fontWeight:900,fontSize:13,border:"3px solid #fbbf24",background:"linear-gradient(135deg,#92400e,#d97706)",color:"#fff",cursor:"pointer",fontFamily:"inherit",boxShadow:"0 0 14px 5px rgba(251,191,36,.35)"}}>↩️ Mutu tō huri — End Turn &amp; Draw to 3</button></div>}
+
+        <div style={{display:"flex",gap:6,marginBottom:6}}>{G.players.map(p=><div key={p.id} style={{flex:1,borderRadius:10,padding:"5px 6px",border:`2px solid ${SEAT[p.id%4].ring}`,background:"rgba(0,0,0,.45)",textAlign:"center"}}><div style={{fontSize:8,color:"#d1d5db",fontWeight:700}}>{p.name}{p.id===myPid?" ★":""}</div><div style={{fontSize:14,color:"#34d399",fontWeight:900}}>{p.hand.length}</div><div style={{fontSize:7,color:"#6b7280"}}>in hand</div></div>)}</div>
+
+        <GameLog lines={G.log}/>
+      </div>
+
+      <div style={{position:"fixed",bottom:0,left:0,right:0,zIndex:10}}>
+        <div style={{display:"flex",justifyContent:"center",marginBottom:4}}>
+          <div style={{fontSize:9,color:SEAT[myPid%4].label,letterSpacing:".12em",fontWeight:700,background:"rgba(0,0,0,.8)",padding:"2px 12px",borderRadius:8,border:`1px solid ${SEAT[myPid%4].ring}`}}>
+            YOUR HAND ({me?.hand.length??0})
+            {G.mode==="place"&&<span style={{color:"#f87171",marginLeft:6}}>· Placed — turn over</span>}
+            {G.mode==="steal"&&<span style={{color:"#34d399",marginLeft:6}}>· {G.stealsCount} steal{G.stealsCount>1?"s":""} — steal more or End Turn</span>}
+            {!G.mode&&myTurn&&<span style={{color:"#fbbf24",marginLeft:6}}>· Steal freely OR place 1</span>}
+            {!myTurn&&<span style={{color:"#6b7280",marginLeft:6}}>· Waiting…</span>}
+          </div>
+        </div>
+        <div style={{height:18,background:"linear-gradient(180deg,#3b1f0a 0%,#5c2d0e 40%,#7a3d14 100%)",borderTop:"3px solid #a0522d",boxShadow:"0 -4px 18px rgba(0,0,0,.7),inset 0 2px 6px rgba(255,200,100,.1)",position:"relative"}}>
+          {[12,28,48,68,84].map(pct=><div key={pct} style={{position:"absolute",top:3,bottom:3,left:`${pct}%`,width:1,background:"rgba(0,0,0,.15)",borderRadius:1}}/>)}
+        </div>
+        <div style={{background:"linear-gradient(180deg,#1a0d04 0%,#110800 100%)",paddingBottom:10,display:"flex",justifyContent:"center",boxShadow:"inset 0 4px 14px rgba(0,0,0,.8)"}}>
+          <div style={{display:"flex",gap:10,paddingLeft:16,paddingRight:16}}>
+            {(me?.hand??[]).map((card,i)=><div key={card.id} style={{marginTop:G.sel===i?-56:-28,transition:"margin-top .18s ease"}}><PCard card={card} greenGlow={G.sel===null&&myTurn&&handCardGlows(card)} onClick={myTurn?()=>selectCard(i):undefined}/></div>)}
+            {Array.from({length:Math.max(0,3-(me?.hand.length??0))}).map((_,i)=><div key={i} style={{width:58,height:84,marginTop:-28,borderRadius:9,border:"2px dashed rgba(100,200,100,.07)"}}/>)}
+          </div>
+        </div>
+      </div>
+      <style>{`@keyframes gpulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TUTORIAL GAME  (single-player vs 3 AI, contextual overlays)
+// ═══════════════════════════════════════════════════════════════════════════
+const TUT_STEPS = [
+  { id:"welcome",  title:"Tūturu mai! Welcome to Raupatu 🎴",
+    body:"This quick tutorial will teach you how to play against AI opponents. Watch for the glowing hints — they'll guide every move.",
+    btn:"Let's play!", phase:"pre" },
+  { id:"select",   title:"Select a card from your hand ↓",
+    body:"Your cards are hidden under the table edge. Tap one to pick it up — it will rise above the table.",
+    btn:null, phase:"need_select" },
+  { id:"steal",    title:"🔥 Raupatuhia! You can steal!",
+    body:"A green glow means your card matches an opponent's top pile card. Tap their box to steal their entire pile!",
+    btn:null, phase:"can_steal" },
+  { id:"place",    title:"📤 Place a card instead",
+    body:"No steal available? Tap any player box to place your card on their pile. Placing ends your turn immediately.",
+    btn:null, phase:"can_place" },
+  { id:"endturn",  title:"↩️ End your steal turn",
+    body:"You've stolen — now hit End Turn to draw back the same number of cards you used.",
+    btn:null, phase:"end_turn" },
+  { id:"ai_watch", title:"🤖 Watch the AI play",
+    body:"AI opponents steal freely when they can, otherwise place on their own pile. Study their moves!",
+    btn:null, phase:"ai_turn" },
+  { id:"done",     title:"Kia ora! You've got it 🏆",
+    body:"You know how to steal, place, and draw back. Head to the main menu to play for real — or keep going here!",
+    btn:"Go to Menu", phase:"done" },
+];
+
+function TutorialGame({ onDone, onSkip }) {
+  const [G, setG] = useState(() => freshGame(["You","Hine-AI","Tūhoe-AI","Rangi-AI"]));
+  const GRef = useRef(G); GRef.current = G;
+
+  // Which tutorial card to show
+  const [tipId, setTipId]   = useState("welcome");
+  const [milestones, setMS] = useState({ stolen:false, placed:false, endedTurn:false, aiSeen:false });
+  const MSRef = useRef(milestones); MSRef.current = milestones;
+
+  const myPid  = 0;
+  const me     = G.players[0];
+  const myTurn = G.turn === 0 && G.phase === "play";
+
+  // Derive contextual tip
+  useEffect(() => {
+    if (tipId === "welcome" || tipId === "done") return;
+    if (G.phase === "over") { setTipId("done"); return; }
+    if (G.turn !== 0) { if (!MSRef.current.aiSeen) { setTipId("ai_watch"); setMS(m=>({...m,aiSeen:true})); } return; }
+    if (G.mode === "steal" && G.cardsUsed > 0 && G.sel === null) { setTipId("endturn"); return; }
+    if (G.sel === null) { setTipId("select"); return; }
+    const selCard = me.hand[G.sel];
+    const hasSteal = G.players.slice(1).some(a=>{ const t=topOf(a.pile); return t&&t.r===selCard?.r&&!G.frozenPiles.includes(a.id); });
+    if (hasSteal) { setTipId("steal"); return; }
+    setTipId("place");
+  }, [G.turn, G.phase, G.sel, G.mode, G.cardsUsed]);
+
+  // AI turns
+  useEffect(() => {
+    if (G.turn === 0 || G.phase !== "play") return;
+    const pid = G.turn;
+    const t = setTimeout(() => {
+      setG(prev => {
+        if (prev.turn !== pid || prev.phase !== "play") return prev;
+        const ps = cloneP(prev.players);
+        let deck = [...prev.deck], used = 0, logs = [...prev.log], found = true;
+        while (found) {
+          found = false;
+          for (let opp = 0; opp < 4; opp++) {
+            if (opp === pid) continue;
+            const top = topOf(ps[opp].pile); if (!top) continue;
+            const mi = ps[pid].hand.findIndex(c => c.r === top.r); if (mi === -1) continue;
+            const card = ps[pid].hand.splice(mi, 1)[0];
+            const stolen = [...ps[opp].pile];
+            ps[pid].pile = [...ps[pid].pile, ...stolen]; ps[opp].pile = [];
+            used++;
+            logs.push(`🤖 ${ps[pid].name} stole ${stolen.length} from ${ps[opp].name} with ${card.r}!`);
+            found = true; break;
+          }
+        }
+        if (!ps[pid].hand.length) { /* nothing to place */ }
+        else if (used === 0) {
+          const sorted = [...ps[pid].hand].sort((a,b)=>RV(a.r)-RV(b.r));
+          const play = sorted[0];
+          ps[pid].hand.splice(ps[pid].hand.findIndex(c=>c.id===play.id),1);
+          ps[pid].pile.push(play); used++;
+          logs.push(`🤖 ${ps[pid].name} places ${play.r}${play.s}`);
+        }
+        let drawn = 0;
+        const before = ps[pid].hand.length;
+        while (ps[pid].hand.length < 3 && deck.length) { ps[pid].hand.push(deck.shift()); drawn++; }
+        if (drawn) logs.push(`🤖 ${ps[pid].name} drew ${drawn} → hand ${ps[pid].hand.length}.`);
+        return maybeOver(nextTurn({...prev,players:ps,deck,log:logs}, pid));
+      });
+    }, 1100 + pid * 200);
+    return () => clearTimeout(t);
+  }, [G.turn, G.phase]);
+
+  // Human actions
+  function selectCard(i) {
+    if (!myTurn || G.mode === "place") return;
+    setG(g => ({...g, sel: g.sel===i ? null : i}));
+  }
+  function clickBox(targetId) {
+    if (!myTurn || G.sel === null) return;
+    setG(prev => {
+      if (prev.sel === null || prev.sel >= prev.players[0].hand.length) return prev;
+      const card = prev.players[0].hand[prev.sel];
+      const target = prev.players[targetId];
+      const top = topOf(target.pile);
+      const frozen = prev.frozenPiles.includes(targetId);
+      const isOpp = targetId !== 0;
+      const matches = top && top.r === card.r;
+      if (isOpp && matches && prev.mode !== "place" && !frozen) {
+        const ps = cloneP(prev.players);
+        ps[0].hand.splice(prev.sel, 1);
+        const stolen = [...ps[targetId].pile];
+        ps[0].pile = [...ps[0].pile, ...stolen]; ps[targetId].pile = [];
+        setMS(m=>({...m, stolen:true}));
+        return {...prev,players:ps,sel:null,mode:"steal",stealsCount:prev.stealsCount+1,cardsUsed:prev.cardsUsed+1,
+          frozenPiles:[...prev.frozenPiles,targetId],
+          log:[...prev.log,`🔥 Raupatuhia! You stole ${stolen.length} from ${target.name} with ${card.r}!`]};
+      }
+      if (prev.mode !== "steal" && !frozen) {
+        const ps = cloneP(prev.players);
+        ps[0].hand.splice(prev.sel, 1); ps[targetId].pile.push(card);
+        const {players:ps2, deck:d2} = fillHand(ps, prev.deck, 0);
+        const drew = ps2[0].hand.length - ps[0].hand.length;
+        setMS(m=>({...m, placed:true}));
+        return maybeOver(nextTurn({...prev,players:ps2,deck:d2,
+          log:[...prev.log,`📤 You placed ${card.r}${card.s} on ${target.name==="You"?"your pile":target.name+"'s pile"}. Drew ${drew} → hand ${ps2[0].hand.length}.`]},0));
+      }
+      if (frozen) return {...prev,sel:null,log:[...prev.log,`🚫 ${target.name}'s pile just stolen — can't place there!`]};
+      return prev;
+    });
+  }
+  function doEndTurn() {
+    if (!myTurn || G.mode !== "steal") return;
+    setG(prev => {
+      const before = prev.players[0].hand.length;
+      const {players,deck} = fillHand(prev.players, prev.deck, 0);
+      const drew = players[0].hand.length - before;
+      setMS(m=>({...m,endedTurn:true}));
+      return maybeOver(nextTurn({...prev,players,deck,
+        log:[...prev.log,`↩️ You drew ${drew} → hand ${players[0].hand.length}. Next player's turn.`]},0));
+    });
+  }
+
+  const selCard = G.sel !== null && G.sel < me.hand.length ? me.hand[G.sel] : null;
+  const canEnd  = myTurn && G.mode==="steal" && G.sel===null;
+  const handCardGlows = card => G.mode!=="place" && G.players.slice(1).some(a=>{const t=topOf(a.pile);return t&&t.r===card.r&&!G.frozenPiles.includes(a.id);});
+
+  const tip = TUT_STEPS.find(s=>s.id===tipId) || TUT_STEPS[1];
+  const accentColor = tipId==="steal"?"#10b981":tipId==="place"?"#3b82f6":tipId==="endturn"?"#f59e0b":"#C9A84C";
+
+  const felt = {width:"100%",minHeight:"100vh",display:"flex",flexDirection:"column",fontFamily:"Georgia,serif",userSelect:"none",
+    background:"radial-gradient(ellipse at 50% 35%,#1c4f1c 0%,#0e2d0e 55%,#061406 100%)",position:"relative",overflowX:"hidden"};
+
+  return (
+    <div style={felt}>
+      {/* felt + borders */}
+      <div style={{position:"fixed",inset:0,pointerEvents:"none",zIndex:0,backgroundImage:`repeating-linear-gradient(0deg,rgba(255,255,255,.008) 0,rgba(255,255,255,.008) 1px,transparent 1px,transparent 9px),repeating-linear-gradient(90deg,rgba(255,255,255,.008) 0,rgba(255,255,255,.008) 1px,transparent 1px,transparent 9px)`}}/>
+      <div style={{position:"fixed",top:0,inset:"0 0 auto",height:6,zIndex:1,opacity:.5,background:"repeating-linear-gradient(90deg,#8B0000 0,#8B0000 20px,#C9A84C 20px,#C9A84C 40px)"}}/>
+      <div style={{position:"fixed",bottom:0,inset:"auto 0 0",height:6,zIndex:1,opacity:.5,background:"repeating-linear-gradient(90deg,#C9A84C 0,#C9A84C 20px,#8B0000 20px,#8B0000 40px)"}}/>
+
+      {/* WELCOME MODAL */}
+      {tipId==="welcome" && (
+        <div style={{position:"fixed",inset:0,zIndex:300,background:"rgba(0,0,0,.88)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{maxWidth:400,width:"100%",borderRadius:24,border:"3px solid #C9A84C",background:"linear-gradient(160deg,#0c1a0c,#111a08)",padding:"32px 28px",textAlign:"center"}}>
+            <div style={{fontSize:52,marginBottom:12}}>🎴</div>
+            <div style={{fontSize:22,fontWeight:900,color:"#C9A84C",letterSpacing:".12em",marginBottom:8}}>TŪTURU MAI!</div>
+            <div style={{fontSize:13,color:"#fbbf24",marginBottom:6}}>Welcome to Raupatu</div>
+            <div style={{fontSize:11,color:"#d1d5db",lineHeight:1.7,marginBottom:24}}>
+              This tutorial teaches you the game against AI opponents.<br/>
+              Watch for <b style={{color:"#10b981"}}>green glows</b> (steal!) and <b style={{color:"#3b82f6"}}>blue glows</b> (place).<br/>
+              The hints up top will guide each move.
+            </div>
+            <div style={{display:"flex",gap:10,justifyContent:"center"}}>
+              <button onClick={()=>setTipId("select")}
+                style={{padding:"12px 28px",borderRadius:16,fontWeight:900,fontSize:14,border:"3px solid #C9A84C",background:"linear-gradient(135deg,#92400e,#C9A84C)",color:"#fff",cursor:"pointer",fontFamily:"inherit"}}>
+                🎮 Let's Play!
+              </button>
+              <button onClick={onSkip}
+                style={{padding:"12px 20px",borderRadius:16,fontWeight:700,fontSize:13,border:"2px solid #6b7280",background:"rgba(0,0,0,.5)",color:"#9ca3af",cursor:"pointer",fontFamily:"inherit"}}>
+                Skip →
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DONE MODAL */}
+      {tipId==="done" && (
+        <div style={{position:"fixed",inset:0,zIndex:300,background:"rgba(0,0,0,.9)",display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{maxWidth:380,width:"100%",borderRadius:24,border:"3px solid #059669",background:"linear-gradient(160deg,#012818,#031f10)",padding:"32px 28px",textAlign:"center"}}>
+            <div style={{fontSize:52,marginBottom:10}}>🏆</div>
+            <div style={{fontSize:20,fontWeight:900,color:"#6ee7b7",marginBottom:8}}>
+              {G.winner==="You" ? "KO AU TE TOA! You won!" : G.winner==="Tie" ? "He ōrite! A tie!" : `${G.winner} won this one!`}
+            </div>
+            <div style={{fontSize:11,color:"#d1d5db",lineHeight:1.7,marginBottom:8}}>
+              {G.players.map(p=>`${p.name}: ${p.pile.length} cards`).join("  ·  ")}
+            </div>
+            <div style={{fontSize:12,color:"#6ee7b7",marginBottom:22}}>Kia ora! You know how to play. Ready for the real thing?</div>
+            <div style={{display:"flex",gap:10,justifyContent:"center",flexWrap:"wrap"}}>
+              <button onClick={onDone}
+                style={{padding:"12px 24px",borderRadius:16,fontWeight:900,fontSize:14,border:"3px solid #059669",background:"linear-gradient(135deg,#065f46,#047857)",color:"#fff",cursor:"pointer",fontFamily:"inherit"}}>
+                🎮 Go to Menu
+              </button>
+              <button onClick={()=>{setG(freshGame(["You","Hine-AI","Tūhoe-AI","Rangi-AI"]));setTipId("select");setMS({stolen:false,placed:false,endedTurn:false,aiSeen:false});}}
+                style={{padding:"12px 20px",borderRadius:16,fontWeight:700,fontSize:13,border:"2px solid #C9A84C",background:"rgba(0,0,0,.5)",color:"#C9A84C",cursor:"pointer",fontFamily:"inherit"}}>
+                🔄 Play Again
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MAIN TABLE */}
+      <div style={{position:"relative",zIndex:2,flex:1,display:"flex",flexDirection:"column",padding:"10px 12px 0",paddingBottom:140}}>
+
+        {/* Tutorial tip bar */}
+        {tipId!=="welcome" && tipId!=="done" && (
+          <div style={{borderRadius:16,border:`2px solid ${accentColor}`,background:`${accentColor}18`,padding:"10px 14px",marginBottom:10,position:"relative",display:"flex",gap:12,alignItems:"flex-start"}}>
+            <div style={{flex:1}}>
+              <div style={{fontSize:12,fontWeight:900,color:accentColor,marginBottom:3}}>{tip.title}</div>
+              <div style={{fontSize:10,color:"#d1d5db",lineHeight:1.5}}>{tip.body}</div>
+            </div>
+            <button onClick={onSkip}
+              style={{flexShrink:0,padding:"4px 12px",borderRadius:10,fontSize:9,fontWeight:700,border:`1px solid ${accentColor}`,background:"rgba(0,0,0,.5)",color:"#9ca3af",cursor:"pointer",fontFamily:"inherit",whiteSpace:"nowrap"}}>
+              Skip Tutorial
+            </button>
+          </div>
+        )}
+
+        {/* Header */}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,gap:6}}>
+          <div>
+            <div style={{fontSize:18,fontWeight:900,letterSpacing:".15em",color:"#C9A84C",textShadow:"0 0 16px rgba(201,168,76,.75),3px 3px 0 #4a0000"}}>✦ RAUPATU ✦</div>
+            <div style={{fontSize:8,color:"#fbbf24",letterSpacing:".15em"}}>TUTORIAL MODE · VS AI</div>
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <div style={{fontSize:10,color:"#fcd34d",background:"rgba(0,0,0,.6)",padding:"3px 10px",borderRadius:10,border:"1px solid #78350f"}}>🃏 <b style={{color:"#fff"}}>{G.deck.length}</b></div>
+            <div style={{fontSize:11,fontWeight:700,padding:"3px 12px",borderRadius:12,background:myTurn?"#065f46":"#4a1010",color:myTurn?"#fff":"#fca5a5"}}>
+              {myTurn?"⚡ YOUR TURN":`🤖 ${G.players[G.turn]?.name}…`}
+            </div>
+            <button onClick={onSkip} style={{padding:"3px 10px",borderRadius:8,fontSize:10,fontWeight:700,border:"1px solid #6b7280",background:"rgba(0,0,0,.5)",color:"#9ca3af",cursor:"pointer",fontFamily:"inherit"}}>
+              Skip
+            </button>
+          </div>
+        </div>
+
+        {/* AI boxes */}
+        <div style={{display:"flex",justifyContent:"center",gap:14,marginBottom:10}}>
+          {G.players.slice(1).map(p=>(
+            <PlayerBox key={p.id} player={p} isActiveTurn={G.turn===p.id}
+              selCard={myTurn?selCard:null} mode={G.mode} frozenPiles={G.frozenPiles}
+              myPid={0} onClick={()=>clickBox(p.id)}/>
+          ))}
+        </div>
+
+        {/* Centre */}
+        <div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:28,flex:1,minHeight:0,paddingBottom:8}}>
+          <PlayerBox player={G.players[0]} isActiveTurn={myTurn}
+            selCard={myTurn?selCard:null} mode={G.mode} frozenPiles={G.frozenPiles}
+            myPid={0} onClick={()=>clickBox(0)}/>
+          <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:5}}>
+            <div style={{fontSize:9,color:"#fbbf24",fontWeight:700,letterSpacing:".1em"}}>DRAW PILE</div>
+            <div style={{position:"relative",width:66,height:96}}>
+              {G.deck.length>2&&<div style={{position:"absolute",width:58,height:84,top:8,left:8,borderRadius:9,border:"3px solid #78350f",background:"#1a3a5c",zIndex:0}}/>}
+              {G.deck.length>1&&<div style={{position:"absolute",width:58,height:84,top:4,left:4,borderRadius:9,border:"3px solid #78350f",background:"#1c3d62",zIndex:1}}/>}
+              <div style={{position:"absolute",top:0,left:0,zIndex:2}}>{G.deck.length>0?<PCard faceDown/>:<div style={{width:58,height:84,borderRadius:9,border:"2px dashed #a16207",display:"flex",alignItems:"center",justifyContent:"center",color:"#a16207",fontSize:10,opacity:.5}}>EMPTY</div>}</div>
+            </div>
+            <div style={{fontSize:9,color:"#fcd34d"}}>{G.deck.length} cards</div>
+          </div>
+          {myTurn&&G.cardsUsed>0&&<div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3}}><div style={{fontSize:8,color:"#9ca3af"}}>USED</div><div style={{fontSize:22,fontWeight:900,color:"#93c5fd",lineHeight:1}}>{G.cardsUsed}</div><div style={{fontSize:9,color:"#34d399"}}>→draw</div></div>}
+        </div>
+
+        {/* End turn */}
+        {canEnd&&(
+          <div style={{display:"flex",justifyContent:"center",marginBottom:8}}>
+            <button onClick={doEndTurn} style={{padding:"9px 28px",borderRadius:18,fontWeight:900,fontSize:13,border:`3px solid ${accentColor}`,background:"linear-gradient(135deg,#92400e,#d97706)",color:"#fff",cursor:"pointer",fontFamily:"inherit",boxShadow:`0 0 14px 5px ${accentColor}55`,animation:"gpulse 1s infinite"}}>
+              ↩️ End Turn &amp; Draw {G.cardsUsed}
+            </button>
+          </div>
+        )}
+
+        {/* Scoreboard */}
+        <div style={{display:"flex",gap:6,marginBottom:6}}>
+          {G.players.map(p=><div key={p.id} style={{flex:1,borderRadius:10,padding:"5px 6px",border:`2px solid ${SEAT[p.id%4].ring}`,background:"rgba(0,0,0,.45)",textAlign:"center"}}><div style={{fontSize:8,color:"#d1d5db",fontWeight:700}}>{p.name}</div><div style={{fontSize:14,color:"#34d399",fontWeight:900}}>{p.hand.length}</div><div style={{fontSize:7,color:"#6b7280"}}>in hand</div></div>)}
+        </div>
+
+        <GameLog lines={G.log}/>
+      </div>
+
+      {/* Table edge + hand */}
+      <div style={{position:"fixed",bottom:0,left:0,right:0,zIndex:10}}>
+        <div style={{display:"flex",justifyContent:"center",marginBottom:4}}>
+          <div style={{fontSize:9,color:SEAT[0].label,letterSpacing:".12em",fontWeight:700,background:"rgba(0,0,0,.8)",padding:"2px 12px",borderRadius:8,border:`1px solid ${SEAT[0].ring}`}}>
+            YOUR HAND ({me.hand.length})
+            {G.mode==="steal"&&<span style={{color:"#34d399",marginLeft:6}}>· {G.stealsCount} steal{G.stealsCount>1?"s":""} — end turn or steal more</span>}
+            {!G.mode&&myTurn&&<span style={{color:accentColor,marginLeft:6}}>· Steal freely OR place 1</span>}
+            {!myTurn&&<span style={{color:"#6b7280",marginLeft:6}}>· AI is playing…</span>}
+          </div>
+        </div>
+        <div style={{height:18,background:"linear-gradient(180deg,#3b1f0a 0%,#5c2d0e 40%,#7a3d14 100%)",borderTop:"3px solid #a0522d",boxShadow:"0 -4px 18px rgba(0,0,0,.7),inset 0 2px 6px rgba(255,200,100,.1)",position:"relative"}}>
+          {[12,28,48,68,84].map(pct=><div key={pct} style={{position:"absolute",top:3,bottom:3,left:`${pct}%`,width:1,background:"rgba(0,0,0,.15)",borderRadius:1}}/>)}
+        </div>
+        <div style={{background:"linear-gradient(180deg,#1a0d04 0%,#110800 100%)",paddingBottom:10,display:"flex",justifyContent:"center",boxShadow:"inset 0 4px 14px rgba(0,0,0,.8)"}}>
+          <div style={{display:"flex",gap:10,paddingLeft:16,paddingRight:16}}>
+            {me.hand.map((card,i)=>(
+              <div key={card.id} style={{marginTop:G.sel===i?-56:-28,transition:"margin-top .18s ease"}}>
+                <PCard card={card} greenGlow={G.sel===null&&myTurn&&handCardGlows(card)} onClick={myTurn?()=>selectCard(i):undefined}/>
+              </div>
+            ))}
+            {Array.from({length:Math.max(0,3-me.hand.length)}).map((_,i)=><div key={i} style={{width:58,height:84,marginTop:-28,borderRadius:9,border:"2px dashed rgba(100,200,100,.07)"}}/>)}
+          </div>
+        </div>
+      </div>
+      <style>{`@keyframes gpulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// APP ROUTER  (tutorial on first launch)
+// ═══════════════════════════════════════════════════════════════════════════
+export default function App(){
+  const tutDone = typeof localStorage !== "undefined" && localStorage.getItem("raupatu_tut");
+  const [screen,setScreen]=useState(tutDone ? "menu" : "tutorial");
+  const [session,setSession]=useState(null);
+  const [gameInit,setGameInit]=useState(null);
+
+  function finishTutorial(){ localStorage.setItem("raupatu_tut","1"); setScreen("menu"); }
+
+  const felt={width:"100%",minHeight:"100vh",fontFamily:"Georgia,serif",
+    background:"radial-gradient(ellipse at 50% 35%,#1c4f1c 0%,#0e2d0e 55%,#061406 100%)"};
+
+  if(screen==="tutorial") return <TutorialGame onDone={finishTutorial} onSkip={finishTutorial}/>;
+  if(screen==="menu") return <div style={felt}><MainMenu onRules={()=>setScreen("rules")} onFree={()=>setScreen("free")} onPremium={()=>setScreen("premium")} onTutorial={()=>setScreen("tutorial")}/></div>;
+  if(screen==="rules") return <div style={felt}><MainMenu onRules={()=>setScreen("rules")} onFree={()=>setScreen("free")} onPremium={()=>setScreen("premium")} onTutorial={()=>setScreen("tutorial")}/><RulesModal onClose={()=>setScreen("menu")}/></div>;
+  if(screen==="free") return <div style={felt}><FreeLobby onBack={()=>setScreen("menu")} onEnterRoom={s=>{setSession(s);setScreen("waiting");}}/></div>;
+  if(screen==="premium") return <div style={felt}><PremiumLobby onBack={()=>setScreen("menu")} onEnterRoom={s=>{setSession(s);setScreen("waiting");}}/></div>;
+  if(screen==="waiting") return <div style={felt}><WaitingRoom session={session} onStart={g=>{setGameInit(g);setScreen("game");}} onLeave={()=>{setSession(null);setScreen("menu");}}/></div>;
+  if(screen==="game") return <GameTable initGame={gameInit} session={session} onLeave={()=>{setSession(null);setGameInit(null);setScreen("menu");}}/>;
+  return null;
+}
